@@ -2,6 +2,7 @@
 require 'logstash/outputs/base'
 require 'logstash/namespace'
 require 'httparty'
+require 'openssl'
 require 'json'
 
 module Initial_State
@@ -12,13 +13,13 @@ module Initial_State
 
   module Error
     class NoAccessKeyError < StandardError
-      def initialize(msg='You must set an access key')
+      def initialize(msg='You must specify an access key')
         super
       end
     end
 
     class NoBucketKeyError < StandardError
-      def initialize(msg='You must set a bucket key')
+      def initialize(msg='You must specify a bucket key and/or bucket name')
         super
       end
     end
@@ -28,20 +29,25 @@ module Initial_State
 
   class Bucket
     include HTTParty
-    ENDPOINT = '/events'
-    URI = Initial_State::Default::BASE_URI + ENDPOINT
+    EVENT_ENDPOINT = '/events'
+    BUCKET_ENDPOINT = '/buckets'
+    EVENT_URI = Initial_State::Default::BASE_URI + EVENT_ENDPOINT
+    BUCKET_URI = Initial_State::Default::BASE_URI + BUCKET_ENDPOINT
 
-    attr_reader :bucket_key, :access_key
+    attr_reader :bucket_name, :bucket_key, :access_key
 
-    def initialize(bucket_key=nil, access_key=nil)
+    def initialize(bucket_name, bucket_key, access_key)
+      @bucket_name = bucket_name
       @bucket_key = bucket_key
       @access_key = access_key
-      raise Initial_State::Error::NoBucketKeyError if @bucket_key.nil?
+      raise Initial_State::Error::NoBucketKeyError if @bucket_name.nil? && @bucket_key.nil?
       raise Initial_State::Error::NoAccessKeyError if @access_key.nil?
+      @bucket_key = OpenSSL::Digest::SHA512.hexdigest @bucket_name if @bucket_key.nil?
+      dump ({'bucketKey' => @bucket_key, 'bucketName' => @bucket_name}), BUCKET_URI
     end
 
-    def dump(event)
-      post URI, prepare(event)
+    def dump(event,uri = EVENT_URI)
+      post uri, prepare(event)
     end
 
     private
@@ -96,16 +102,30 @@ end
 class LogStash::Outputs::InitialState < LogStash::Outputs::Base
   config_name 'initialstate'
 
-  # Supply the Intial State bucket key.
+  # Supply the Intial State bucket name, supports sprintf format. A new bucket and
+  # bucket key will be created if required. You must specify a bucket name and/or
+  # a bucket key.
   #
   # Example:
   # [source,ruby]
   #     filter {
   #       initialstate {
-  #         bucket_key => "zxse345s"
+  #         bucket_name => "CPU Temp %{server_name}"
   #       }
   #     }
-  config :bucket_key, :validate => :string, :required => true
+  config :bucket_name, :validate => :string, :default => nil
+
+  # Supply the Intial State bucket key. If not specifed a SHA512 hash on the
+  # bucket name will be used.
+  #
+  # Example:
+  # [source,ruby]
+  #     filter {
+  #       initialstate {
+  #         bucket_key => "b070838"
+  #       }
+  #     }
+  config :bucket_key, :validate => :string, :default => nil
 
   # Supply the Intial State access key.
   #
@@ -166,7 +186,7 @@ class LogStash::Outputs::InitialState < LogStash::Outputs::Base
         istate_event = Initial_State::Event.new event.sprintf(stream_key), event.sprintf(stream_value), @epoch, event.get(@timestamp)
         event_data << istate_event.to_hash
       end
-      bucket = Initial_State::Bucket.new @bucket_key, @access_key
+      bucket = Initial_State::Bucket.new event.sprintf(@bucket_name), @bucket_key, @access_key
       bucket.dump event_data
     rescue Exception => e
       @logger.warn('Inital State threw exception', :exception => e.message, :backtrace => e.backtrace, :class => e.class.name)
